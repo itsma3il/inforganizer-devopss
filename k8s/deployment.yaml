@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inforganizer
+  labels:
+    app: inforganizer
+spec:
+  # SQLite does not support concurrent writes from multiple processes sharing
+  # the same PVC. Keep replicas at 1 to avoid database corruption.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inforganizer
+  template:
+    metadata:
+      labels:
+        app: inforganizer
+    spec:
+      containers:
+        - name: inforganizer
+          image: ghcr.io/itsma3il/inforganizer:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: NODE_ENV
+              value: production
+            - name: DB_PATH
+              value: /data/inforganizer.db
+          volumeMounts:
+            - name: data-volume
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+      volumes:
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: inforganizer-pvc

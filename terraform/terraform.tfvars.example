@@ -1,0 +1,6 @@
+# Copy this file to terraform.tfvars and fill in the values.
+# Never commit terraform.tfvars to version control.
+
+key_name     = "your-aws-keypair-name"
+allowed_cidr = "0.0.0.0/0"   # Replace with your IP: e.g. "203.0.113.5/32"
+aws_region   = "eu-west-3"
