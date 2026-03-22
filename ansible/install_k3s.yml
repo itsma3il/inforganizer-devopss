@@ -36,7 +36,7 @@
           - ca-certificates
           - gnupg
           - lsb-release
-          - gettext-base    # provides envsubst — used to inject secrets into postgres.yaml
+          - gettext-base # provides envsubst — used to inject secrets into postgres.yaml
         state: present
 
     - name: Disable swap (required by Kubernetes)
@@ -66,7 +66,6 @@
         groups: docker
         append: true
 
-
 - name: Install k3s on master node
   hosts: master
   become: true
@@ -93,8 +92,7 @@
     - name: Store master IP and token as facts
       set_fact:
         k3s_token: "{{ k3s_token_raw.content | b64decode | trim }}"
-        master_ip:  "{{ ansible_host }}"
-
+        master_ip: "{{ ansible_host | default(inventory_hostname) }}"
 
 - name: Install k3s agent on worker nodes
   hosts: workers
@@ -104,12 +102,36 @@
     - name: Install k3s agent and join cluster
       shell: |
         curl -sfL https://get.k3s.io | \
-          K3S_URL=https://{{ hostvars[groups['master'][0]].ansible_host }}:6443 \
+          K3S_URL=https://{{ hostvars[groups['master'][0]].master_ip | default(hostvars[groups['master'][0]].ansible_host | default(groups['master'][0])) }}:6443 \
           K3S_TOKEN={{ hostvars[groups['master'][0]].k3s_token }} \
           sh -
       args:
         creates: /usr/local/bin/k3s
 
+- name: Wait for cluster to stabilize
+  hosts: master
+  become: true
+
+  tasks:
+    - name: Wait for all nodes to be ready
+      command: k3s kubectl wait --for=condition=Ready node --all --timeout=300s
+      retries: 5
+      delay: 15
+      register: result
+      until: result.rc == 0
+
+    - name: Wait for core system pods (coredns, etc) to be running
+      command: k3s kubectl wait --for=condition=ready pod -l k8s-app=kube-dns -n kube-system --timeout=120s
+      retries: 3
+      delay: 10
+      ignore_errors: true
+
+    - name: Final API server connectivity check
+      command: k3s kubectl cluster-info
+      retries: 5
+      delay: 10
+      register: result
+      until: result.rc == 0
 
 - name: Deploy Inforganizer to Kubernetes
   hosts: master
@@ -119,7 +141,7 @@
     # Read from the environment of the Ansible control node.
     # Set POSTGRES_PASSWORD and JWT_SECRET before running this playbook.
     postgres_password: "{{ lookup('env', 'POSTGRES_PASSWORD') }}"
-    jwt_secret:        "{{ lookup('env', 'JWT_SECRET') }}"
+    jwt_secret: "{{ lookup('env', 'JWT_SECRET') }}"
 
   tasks:
     - name: Validate required secrets are set
@@ -137,31 +159,55 @@
         dest: /tmp/
       loop:
         - ../k8s/pvc.yaml
-        - ../k8s/postgres.yaml  
+        - ../k8s/postgres.yaml
         - ../k8s/deployment.yaml
         - ../k8s/service.yaml
 
     - name: Apply PVC (PostgreSQL storage)
       command: k3s kubectl apply -f /tmp/pvc.yaml
+      retries: 3
+      delay: 10
+      register: result
+      until: result.rc == 0
 
     - name: Apply PostgreSQL (Secret, Deployment, Service)
       shell: envsubst < /tmp/postgres.yaml | k3s kubectl apply -f -
       environment:
         POSTGRES_PASSWORD: "{{ postgres_password }}"
-        JWT_SECRET:        "{{ jwt_secret }}"
+        JWT_SECRET: "{{ jwt_secret }}"
+      retries: 3
+      delay: 10
+      register: result
+      until: result.rc == 0
 
     - name: Wait for PostgreSQL to be ready
       command: k3s kubectl rollout status deployment/postgres --timeout=120s
+      retries: 2
+      delay: 15
+      register: result
+      until: result.rc == 0
 
     - name: Apply App Deployment
       command: k3s kubectl apply -f /tmp/deployment.yaml
+      retries: 3
+      delay: 10
+      register: result
+      until: result.rc == 0
 
     - name: Apply App Service
       command: k3s kubectl apply -f /tmp/service.yaml
+      retries: 3
+      delay: 10
+      register: result
+      until: result.rc == 0
 
     - name: Wait for deployment to be ready
       command: k3s kubectl rollout status deployment/inforganizer --timeout=120s
+      retries: 2
+      delay: 15
+      register: result
+      until: result.rc == 0
 
     - name: Print app URL
       debug:
-        msg: "Inforganizer is accessible at http://{{ ansible_host }}:30080"
+        msg: "Inforganizer is accessible at http://{{ ansible_host | default(inventory_hostname) }}:30080"

@@ -6,6 +6,11 @@ metadata:
     app: inforganizer
 spec:
   replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: inforganizer
@@ -14,13 +19,32 @@ spec:
       labels:
         app: inforganizer
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - inforganizer
+                topologyKey: kubernetes.io/hostname
+      imagePullSecrets:
+        - name: ecr-creds
       initContainers:
         - name: wait-for-postgres
           image: postgres:16-alpine
-          command: ['sh', '-c', 'until pg_isready -h postgres -p 5432; do echo "waiting for postgres..."; sleep 3; done']
+          command:
+            [
+              "sh",
+              "-c",
+              'until pg_isready -h postgres -p 5432; do echo "waiting for postgres..."; sleep 3; done',
+            ]
       containers:
         - name: inforganizer
-          image: ghcr.io/itsma3il/inforganizer:latest
+          image: ${AWS_ACCOUNT_ID}.dkr.ecr.eu-west-3.amazonaws.com/inforganizer:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 3000

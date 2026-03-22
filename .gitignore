@@ -27,6 +27,11 @@ terraform/.terraform.lock.hcl
 terraform/*.tfstate
 terraform/*.tfstate.*
 terraform/terraform.tfvars
+terraform/terraform_plan.txt
 
 # Ansible
 ansible/*.retry
+ansible/inventory.ini
+
+# Local troubleshooting outputs (may contain sensitive values)
+docs/*
