@@ -28,6 +28,9 @@ env:
   ECR_REPOSITORY: inforganizer
 
 jobs:
+  # ─────────────────────────────────────────────────────────────
+  # JOB 1 — Tests
+  # ─────────────────────────────────────────────────────────────
   test:
     name: Install and Test
     runs-on: ubuntu-latest
@@ -72,6 +75,9 @@ jobs:
       - name: Run tests
         run: pnpm test
 
+  # ─────────────────────────────────────────────────────────────
+  # JOB 2 — Build & push to ECR
+  # ─────────────────────────────────────────────────────────────
   build-push-ecr:
     name: Build and Push to ECR
     runs-on: ubuntu-latest
@@ -79,7 +85,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     permissions:
-      id-token: write
+      id-token: write # required for OIDC token
       contents: read
 
     outputs:
@@ -90,6 +96,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ── Validate secrets before doing any AWS work ──────────
+      - name: Validate required secrets
+        run: |
+          if [ -z "${{ secrets.AWS_ACCOUNT_ID }}" ]; then
+            echo "::error::AWS_ACCOUNT_ID secret is not set."
+            echo "Set it in: Settings -> Secrets and variables -> Actions -> New repository secret"
+            exit 1
+          fi
+          if [ -z "${{ secrets.AWS_GITHUB_ROLE_ARN }}" ]; then
+            echo "::error::AWS_GITHUB_ROLE_ARN secret is not set."
+            exit 1
+          fi
+          # Basic sanity: account ID must be 12 digits
+          if ! echo "${{ secrets.AWS_ACCOUNT_ID }}" | grep -qE '^[0-9]{12}$'; then
+            echo "::error::AWS_ACCOUNT_ID does not look like a valid 12-digit AWS account ID."
+            exit 1
+          fi
+          echo "Secrets validated OK."
+
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -99,33 +124,57 @@ jobs:
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
+      # ── Compute and export image coordinates ────────────────
+      #
+      # FIX: IMAGE_URI is built here from validated secret, not
+      # from a variable that could silently be empty. The outputs
+      # are written explicitly and then immediately echo'd so the
+      # workflow log shows the exact values that will be consumed
+      # by gitops-update.
       - name: Set image URI and tag
         id: vars
         run: |
+          set -e
+
           ACCOUNT_ID="${{ secrets.AWS_ACCOUNT_ID }}"
-          if [ -z "$ACCOUNT_ID" ]; then
-            echo "ERROR: AWS_ACCOUNT_ID secret is not set in GitHub Actions"
-            echo "Set it in: Settings -> Secrets and variables -> Actions -> New repository secret"
+          IMAGE_TAG="sha-${GITHUB_SHA::12}"
+          IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}"
+          FULL_IMAGE="${IMAGE_URI}:${IMAGE_TAG}"
+
+          # Validate the constructed URI looks sane before writing outputs
+          if ! echo "${IMAGE_URI}" | grep -qE '^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/.+$'; then
+            echo "::error::Constructed IMAGE_URI is malformed: '${IMAGE_URI}'"
             exit 1
           fi
 
-          IMAGE_TAG="sha-${GITHUB_SHA::12}"
-          IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}"
-
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${IMAGE_URI}"  >> "$GITHUB_OUTPUT"
 
-          echo "Built image reference: ${IMAGE_URI}:${IMAGE_TAG}"
+          echo "Image tag : ${IMAGE_TAG}"
+          echo "Image URI : ${IMAGE_URI}"
+          echo "Full image: ${FULL_IMAGE}"
 
       - name: Build and push
         run: |
-          docker build \
-            -t "${{ steps.vars.outputs.image_uri }}:${{ steps.vars.outputs.image_tag }}" \
-            -t "${{ steps.vars.outputs.image_uri }}:latest" \
-            .
-          docker push "${{ steps.vars.outputs.image_uri }}:${{ steps.vars.outputs.image_tag }}"
-          docker push "${{ steps.vars.outputs.image_uri }}:latest"
+          set -e
+          IMAGE_URI="${{ steps.vars.outputs.image_uri }}"
+          IMAGE_TAG="${{ steps.vars.outputs.image_tag }}"
+          FULL_IMAGE="${IMAGE_URI}:${IMAGE_TAG}"
 
+          docker build \
+            -t "${FULL_IMAGE}" \
+            -t "${IMAGE_URI}:latest" \
+            .
+
+          docker push "${FULL_IMAGE}"
+          docker push "${IMAGE_URI}:latest"
+
+          echo "Pushed: ${FULL_IMAGE}"
+          echo "Pushed: ${IMAGE_URI}:latest"
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 3 — Update GitOps manifest
+  # ─────────────────────────────────────────────────────────────
   gitops-update:
     name: Update GitOps Manifest
     runs-on: ubuntu-latest
@@ -143,53 +192,88 @@ jobs:
 
       - name: Update deployment image tag
         env:
-          IMAGE_URI: ${{ needs.build-push-ecr.outputs.image_uri }}
+          # FIX: Rebuild IMAGE_URI from the secret directly here as well.
+          # Job outputs are the primary source, but we cross-check with the
+          # secret so that a silent output-passing failure is caught early.
           IMAGE_TAG: ${{ needs.build-push-ecr.outputs.image_tag }}
+          IMAGE_URI_FROM_OUTPUT: ${{ needs.build-push-ecr.outputs.image_uri }}
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
         run: |
           set -e
 
-          # Validate that IMAGE_URI is not empty and looks correct
-          if [ -z "$IMAGE_URI" ] || [ "$IMAGE_URI" = ".dkr.ecr.eu-west-3.amazonaws.com/inforganizer" ]; then
-            echo "ERROR: IMAGE_URI is malformed or AWS_ACCOUNT_ID secret not set"
-            echo "IMAGE_URI=$IMAGE_URI"
+          # ── 1. Reconstruct IMAGE_URI from secret (authoritative) ──
+          IMAGE_URI_FROM_SECRET="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}"
+
+          # ── 2. Validate the output-passed URI matches the secret-derived one ──
+          if [ "${IMAGE_URI_FROM_OUTPUT}" != "${IMAGE_URI_FROM_SECRET}" ]; then
+            echo "::warning::image_uri output ('${IMAGE_URI_FROM_OUTPUT}') does not match"
+            echo "           secret-derived URI ('${IMAGE_URI_FROM_SECRET}')."
+            echo "           Using secret-derived URI as authoritative source."
+          fi
+
+          # Always use the secret-derived URI — never trust a potentially empty output
+          IMAGE_URI="${IMAGE_URI_FROM_SECRET}"
+
+          # ── 3. Validate IMAGE_URI format ──
+          if ! echo "${IMAGE_URI}" | grep -qE '^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/.+$'; then
+            echo "::error::IMAGE_URI is malformed: '${IMAGE_URI}'"
+            echo "Check that AWS_ACCOUNT_ID secret is a valid 12-digit account ID."
             exit 1
           fi
 
-          if [ -z "$IMAGE_TAG" ]; then
-            echo "ERROR: IMAGE_TAG is empty"
+          # ── 4. Validate IMAGE_TAG ──
+          if [ -z "${IMAGE_TAG}" ]; then
+            echo "::error::IMAGE_TAG is empty. The build-push-ecr job may not have set its outputs correctly."
             exit 1
           fi
 
+          if ! echo "${IMAGE_TAG}" | grep -qE '^sha-[0-9a-f]{12}$'; then
+            echo "::error::IMAGE_TAG has unexpected format: '${IMAGE_TAG}' (expected sha-<12 hex chars>)"
+            exit 1
+          fi
+
+          # ── 5. Construct and log the full image reference ──
           FULL_IMAGE="${IMAGE_URI}:${IMAGE_TAG}"
-          echo "Updating deployment.yaml with image: ${FULL_IMAGE}"
+          echo "Updating k8s/deployment.yaml with image: ${FULL_IMAGE}"
 
-          # Use a safer sed that only replaces specific image lines, not corrupting the file
-          sed -i.bak \
-            -e "s|image: .*dkr.ecr.*$|image: ${FULL_IMAGE}|" \
-            -e "s|image: :sha-.*$|image: ${FULL_IMAGE}|" \
+          # ── 6. Apply the substitution ──
+          # Pattern matches ANY image line that contains this ECR repo path,
+          # regardless of what tag was previously written.
+          # We do NOT have a fallback pattern for ":sha-*" so a malformed
+          # image can never "succeed" silently — if the pattern doesn't match
+          # the file, the verification step below will catch it.
+          sed -i \
+            "s|image: ${IMAGE_URI}:.*|image: ${FULL_IMAGE}|" \
             k8s/deployment.yaml
 
-          echo "Updated deployment.yaml:"
+          echo "--- k8s/deployment.yaml image lines after update ---"
           grep -n "image:" k8s/deployment.yaml
 
-          # Verify the image was updated correctly
-          if ! grep -q "${FULL_IMAGE}" k8s/deployment.yaml; then
-            echo "ERROR: Image tag was not updated correctly"
+          # ── 7. Verify the update was applied ──
+          if ! grep -qF "image: ${FULL_IMAGE}" k8s/deployment.yaml; then
+            echo "::error::Verification failed — '${FULL_IMAGE}' not found in k8s/deployment.yaml."
+            echo "Current image lines:"
+            grep -n "image:" k8s/deployment.yaml
+            echo ""
+            echo "Possible cause: the image line in deployment.yaml does not match the"
+            echo "expected pattern 'image: <ECR_URI>:<tag>'. Check the file manually."
             exit 1
           fi
+
+          echo "Verification passed: image updated to ${FULL_IMAGE}"
 
       - name: Commit and push manifest update
         env:
           IMAGE_TAG: ${{ needs.build-push-ecr.outputs.image_tag }}
         run: |
           set -e
+
           if git diff --quiet -- k8s/deployment.yaml; then
-            echo "No manifest changes to commit"
+            echo "No manifest changes to commit (image tag was already up to date)."
             exit 0
           fi
 
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add k8s/deployment.yaml
           git commit -m "chore(gitops): update image tag to ${IMAGE_TAG} [skip ci]"
