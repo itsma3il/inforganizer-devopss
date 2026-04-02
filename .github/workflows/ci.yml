@@ -113,7 +113,55 @@ jobs:
             echo "::error::AWS_ACCOUNT_ID does not look like a valid 12-digit AWS account ID."
             exit 1
           fi
+
+          if ! echo "${{ secrets.AWS_GITHUB_ROLE_ARN }}" | grep -qE '^arn:aws:iam::[0-9]{12}:role/.+$'; then
+            echo "::error::AWS_GITHUB_ROLE_ARN is malformed (expected arn:aws:iam::<12-digit-account>:role/<name>)."
+            exit 1
+          fi
+
+          ROLE_ACCOUNT_ID="$(echo "${{ secrets.AWS_GITHUB_ROLE_ARN }}" | cut -d: -f5)"
+          if [ "${ROLE_ACCOUNT_ID}" != "${{ secrets.AWS_ACCOUNT_ID }}" ]; then
+            echo "::error::Role account ID (${ROLE_ACCOUNT_ID}) does not match AWS_ACCOUNT_ID secret (${{ secrets.AWS_ACCOUNT_ID }})."
+            exit 1
+          fi
+
           echo "Secrets validated OK."
+
+      - name: OIDC diagnostics (safe claims only)
+        run: |
+          set -euo pipefail
+          echo "GitHub repository: ${GITHUB_REPOSITORY}"
+          echo "GitHub event     : ${GITHUB_EVENT_NAME}"
+          echo "GitHub ref       : ${GITHUB_REF}"
+
+          OIDC_JSON="$(curl -sSf \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")"
+
+          OIDC_TOKEN="$(echo "${OIDC_JSON}" | jq -r '.value')"
+
+          export OIDC_TOKEN
+          python3 - <<'PY'
+import base64
+import json
+import os
+
+token = os.environ["OIDC_TOKEN"]
+payload = token.split(".")[1]
+payload += "=" * (-len(payload) % 4)
+claims = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+
+safe_claims = {
+    "iss": claims.get("iss"),
+    "aud": claims.get("aud"),
+    "sub": claims.get("sub"),
+    "repository": claims.get("repository"),
+    "ref": claims.get("ref"),
+    "workflow_ref": claims.get("job_workflow_ref"),
+}
+print("OIDC claims:")
+print(json.dumps(safe_claims, indent=2))
+PY
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4

@@ -47,6 +47,12 @@ variable "allowed_cidr" {
   type        = string
 }
 
+variable "ec2_role_name" {
+  description = "Existing IAM role name to attach to EC2 instances"
+  type        = string
+  default     = "inforganizer-ec2-ecr-role"
+}
+
 # ─── VPC ──────────────────────────────────────────────────────────────────────
 resource "aws_vpc" "inforganizer" {
   cidr_block           = "10.0.0.0/16"
@@ -138,6 +144,11 @@ data "aws_ami" "ubuntu" {
   }
 }
 
+resource "aws_iam_instance_profile" "inforganizer_ec2" {
+  name_prefix = "inforganizer-ec2-"
+  role        = var.ec2_role_name
+}
+
 # ─── EC2 instances ────────────────────────────────────────────────────────────
 resource "aws_instance" "master" {
   ami                    = data.aws_ami.ubuntu.id
@@ -145,6 +156,7 @@ resource "aws_instance" "master" {
   key_name               = var.key_name
   subnet_id              = aws_subnet.public.id
   vpc_security_group_ids = [aws_security_group.k8s.id]
+  iam_instance_profile   = aws_iam_instance_profile.inforganizer_ec2.name
 
   root_block_device {
     volume_size = 20
@@ -160,6 +172,7 @@ resource "aws_instance" "worker" {
   key_name               = var.key_name
   subnet_id              = aws_subnet.public.id
   vpc_security_group_ids = [aws_security_group.k8s.id]
+  iam_instance_profile   = aws_iam_instance_profile.inforganizer_ec2.name
 
   root_block_device {
     volume_size = 20

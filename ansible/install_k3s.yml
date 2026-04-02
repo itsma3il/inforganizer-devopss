@@ -118,7 +118,8 @@
     - name: Store master IP and token as facts
       set_fact:
         k3s_token: "{{ k3s_token_raw.content | b64decode | trim }}"
-        master_ip: "{{ ansible_host | default(inventory_hostname) }}"
+        # Use private network IP so worker joins over VPC/SG internal traffic.
+        master_ip: "{{ ansible_default_ipv4.address | default(ansible_host | default(inventory_hostname)) }}"
 
 - name: Install k3s agent on worker nodes
   hosts: workers
@@ -128,12 +129,14 @@
     - name: Install k3s agent and join cluster
       shell: |
         curl -sfL https://get.k3s.io | \
-          INSTALL_K3S_EXEC="agent --kubelet-arg=fail-swap-on=false" \
-          K3S_URL=https://{{ hostvars[groups['master'][0]].master_ip | default(hostvars[groups['master'][0]].ansible_host | default(groups['master'][0])) }}:6443 \
-          K3S_TOKEN={{ hostvars[groups['master'][0]].k3s_token }} \
           sh -
+      environment:
+        INSTALL_K3S_EXEC: "agent --kubelet-arg=fail-swap-on=false"
+        K3S_URL: "https://{{ hostvars[groups['master'][0]].master_ip | default(hostvars[groups['master'][0]].ansible_host | default(groups['master'][0])) }}:6443"
+        K3S_TOKEN: "{{ hostvars[groups['master'][0]].k3s_token }}"
       args:
         creates: /usr/local/bin/k3s
+        executable: /bin/bash
 
 - name: Wait for cluster to stabilize
   hosts: master
@@ -196,18 +199,27 @@
       register: result
       until: result.rc == 0
 
+    - name: Get ECR login password from control node
+      command: aws ecr get-login-password --region {{ ecr_region }}
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: ecr_password_cmd
+      no_log: true
+      changed_when: false
+
     - name: Create or refresh ecr-creds secret
       shell: |
         set -e
-        ECR_PASSWORD="$(aws ecr get-login-password --region {{ ecr_region }})"
         k3s kubectl create secret docker-registry ecr-creds \
           --docker-server="{{ ecr_registry }}" \
           --docker-username="AWS" \
-          --docker-password="${ECR_PASSWORD}" \
+          --docker-password="{{ ecr_password_cmd.stdout | trim }}" \
           --dry-run=client -o yaml | k3s kubectl apply -f -
       retries: 3
       delay: 10
       register: result
+      no_log: true
       until: result.rc == 0
 
     - name: Install ecr-creds refresh script on master
@@ -223,6 +235,22 @@
             --docker-username="AWS" \
             --docker-password="${ECR_PASSWORD}" \
             --dry-run=client -o yaml | k3s kubectl apply -f -
+
+    - name: Configure AWS credentials for periodic ECR refresh script
+      copy:
+        dest: /root/.aws/credentials
+        mode: "0600"
+        content: |
+          [default]
+          aws_access_key_id={{ lookup('env', 'AWS_ACCESS_KEY_ID') }}
+          aws_secret_access_key={{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}
+          {% if lookup('env', 'AWS_SESSION_TOKEN') | length > 0 %}
+          aws_session_token={{ lookup('env', 'AWS_SESSION_TOKEN') }}
+          {% endif %}
+      when:
+        - lookup('env', 'AWS_ACCESS_KEY_ID') | length > 0
+        - lookup('env', 'AWS_SECRET_ACCESS_KEY') | length > 0
+      no_log: true
 
     - name: Ensure periodic ecr-creds refresh cron is present
       cron:
@@ -251,7 +279,7 @@
     - name: Install ArgoCD components with retry/fallback
       block:
         - name: Apply ArgoCD install manifest (client-side apply)
-          command: k3s kubectl apply --request-timeout=600s -f /tmp/argocd-install.yaml
+          command: k3s kubectl apply -n argocd --request-timeout=600s -f /tmp/argocd-install.yaml
           retries: 5
           delay: 20
           register: argocd_apply_client
@@ -260,7 +288,7 @@
         - name: Apply ArgoCD install manifest (server-side fallback)
           command: >
             k3s kubectl apply --server-side --force-conflicts
-            --request-timeout=600s -f /tmp/argocd-install.yaml
+            -n argocd --request-timeout=600s -f /tmp/argocd-install.yaml
           retries: 5
           delay: 20
           register: argocd_apply_server
